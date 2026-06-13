@@ -1,1051 +1,384 @@
 from __future__ import annotations
 
-from io import BytesIO
+from pathlib import Path
+import json
+import io
 
-import joblib
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import seaborn as sns
 import streamlit as st
-from scipy.stats import wilcoxon
-from sklearn.base import clone
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import (
-    auc,
-    confusion_matrix,
-    precision_recall_curve,
-    roc_curve,
-)
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.pipeline import Pipeline
 
 from ml_pipeline import (
-    RANDOM_STATE,
-    build_optuna_estimator,
-    fit_default_model,
-    get_models,
-    get_preprocessor,
-    load_data,
-    prepare_features,
-    split_columns,
-    train_models,
+    TARGET, PREFERRED_FEATURES, NUMERIC_FEATURES, CATEGORICAL_FEATURES,
+    find_dataset_path, load_raw_data, clean_real_estate_data, market_summary, district_benchmark,
+    evaluate_models, split_xy, predict_single, prepare_prediction_features, model_feature_importance,
+    bootstrap_metric_ci, learning_curve_table, evidence_pack, save_model, dataset_fingerprint, environment_metadata,
 )
 
-st.set_page_config(
-    page_title="Student Performance ML",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+APP_NAME = "Tashkent Property Price Command Center"
 
-st.markdown(
-    """
-    <style>
-        .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-        [data-testid="stMetricValue"] {font-size: 1.55rem;}
-        .small-note {font-size: 0.88rem; opacity: 0.78;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title=APP_NAME, page_icon="🏙️", layout="wide")
 
-
-@st.cache_data(show_spinner=False)
-def get_data() -> pd.DataFrame:
-    return load_data()
+st.markdown("""
+<style>
+:root{--navy:#0f172a;--ink:#111827;--muted:#64748b;--teal:#0f766e;--blue:#2563eb;--line:#e2e8f0;--soft:#f8fafc;}
+.block-container{padding-top:1rem;max-width:1360px}.main .block-container{padding-bottom:3rem}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#f8fafc,#eef6ff);border-right:1px solid #dbeafe}
+.hero{background:linear-gradient(135deg,#0f172a 0%,#1d4ed8 48%,#0f766e 100%);color:white;padding:2.2rem 2.4rem;border-radius:30px;box-shadow:0 24px 65px rgba(15,23,42,.24);margin-bottom:1.1rem}
+.hero h1{font-size:2.55rem;letter-spacing:-.045em;margin:.25rem 0 1rem}.hero p{font-size:1.06rem;line-height:1.72;color:#e0f2fe;max-width:1120px}.kicker{font-size:.76rem;text-transform:uppercase;letter-spacing:.18em;font-weight:900;color:#a5f3fc}
+.pill{display:inline-block;border:1px solid rgba(255,255,255,.28);background:rgba(255,255,255,.11);border-radius:999px;padding:.43rem .72rem;margin:.16rem .16rem .16rem 0;font-size:.82rem;font-weight:700}
+.card{background:#fff;border:1px solid var(--line);border-radius:22px;padding:1.15rem 1.25rem;box-shadow:0 12px 30px rgba(15,23,42,.06);margin-bottom:1rem}.card h3{margin-top:0}.soft{background:linear-gradient(135deg,#ffffff,#eef9ff)}
+.metric-card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:1rem;min-height:102px;box-shadow:0 10px 25px rgba(15,23,42,.05)}.metric-label{font-size:.85rem;color:var(--muted)}.metric-value{font-size:1.55rem;font-weight:900;color:var(--ink);margin-top:.35rem}
+.workflow{display:flex;gap:.55rem;flex-wrap:wrap}.step{background:#eef6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:14px;padding:.52rem .78rem;font-weight:800;font-size:.84rem}.muted{color:var(--muted);font-size:.92rem}.ok{color:#047857;font-weight:800}.warn{color:#b45309;font-weight:800}.bad{color:#b91c1c;font-weight:800}
+.sidebar-chip{padding:.75rem .85rem;border-radius:18px;background:#fff;border:1px solid #dbeafe;margin:.6rem 0;box-shadow:0 8px 18px rgba(15,23,42,.04)}
+</style>
+""", unsafe_allow_html=True)
 
 
-@st.cache_resource(show_spinner=False)
-def get_cached_default_model(X_data: pd.DataFrame, y_data: np.ndarray):
-    cat, num = split_columns(X_data)
-    prep = get_preprocessor(cat, num)
-    return fit_default_model(X_data, y_data, prep)
+def money(x: float | int | None) -> str:
+    if x is None or pd.isna(x):
+        return "—"
+    x = float(x)
+    if abs(x) >= 1_000_000_000:
+        return f"{x/1_000_000_000:,.2f} bn UZS"
+    return f"{x/1_000_000:,.1f} mln UZS"
 
 
-def metric_mean(bundle: dict, model_name: str, metric: str) -> float:
-    return float(bundle["results"][model_name][metric]["mean"])
+def pct(x: float | None) -> str:
+    if x is None or pd.isna(x):
+        return "—"
+    return f"{100*x:.1f}%"
 
 
-def metric_std(bundle: dict, model_name: str, metric: str) -> float:
-    return float(bundle["results"][model_name][metric]["std"])
+def metric_card(label: str, value: str, note: str = ""):
+    st.markdown(f"""
+    <div class='metric-card'><div class='metric-label'>{label}</div><div class='metric-value'>{value}</div><div class='muted'>{note}</div></div>
+    """, unsafe_allow_html=True)
 
 
-def format_result_table(bundle: dict) -> pd.DataFrame:
-    rows = []
-    sorted_models = sorted(
-        bundle["results"],
-        key=lambda name: metric_mean(bundle, name, "F1"),
-        reverse=True,
-    )
-    for rank, name in enumerate(sorted_models, start=1):
-        result = bundle["results"][name]
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, "")
-        rows.append(
-            {
-                "Rank": f"{medal} {rank}".strip(),
-                "Model": name,
-                "Accuracy": f"{result['Accuracy']['mean']:.3f} ± {result['Accuracy']['std']:.3f}",
-                "Precision": f"{result['Precision']['mean']:.3f} ± {result['Precision']['std']:.3f}",
-                "Recall": f"{result['Recall']['mean']:.3f} ± {result['Recall']['std']:.3f}",
-                "F1": f"{result['F1']['mean']:.3f} ± {result['F1']['std']:.3f}",
-                "AUC-ROC": f"{result['AUC-ROC']['mean']:.3f} ± {result['AUC-ROC']['std']:.3f}",
-            }
-        )
-    return pd.DataFrame(rows)
+def hero():
+    st.markdown("""
+    <div class='hero'>
+      <div class='kicker'>Pearson BTEC Level 6 · Applied AI Capstone</div>
+      <h1>Tashkent Property Price Command Center</h1>
+      <p>A professional real-estate analytics prototype for estimating apartment asking prices from OLX Uzbekistan listings. The system audits data quality, cleans noisy scraped fields, compares models against a baseline, explains price drivers and simulates valuation scenarios for transparent decision support.</p>
+      <span class='pill'>Leakage-safe pipeline</span><span class='pill'>OLX market audit</span><span class='pill'>Regression model lab</span><span class='pill'>Scenario simulator</span><span class='pill'>Evidence export</span>
+    </div>
+    """, unsafe_allow_html=True)
 
 
-def model_to_bytes(model) -> bytes:
-    buffer = BytesIO()
-    joblib.dump(model, buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
+@st.cache_data(show_spinner="Loading and cleaning real-estate data...")
+def get_data(uploaded_bytes: bytes | None = None, uploaded_name: str | None = None):
+    if uploaded_bytes is not None:
+        raw = load_raw_data(uploaded_file=io.BytesIO(uploaded_bytes))
+    else:
+        path = find_dataset_path()
+        raw = load_raw_data(path)
+    clean = clean_real_estate_data(raw)
+    return raw, clean
 
 
-def normalize_shap_explanation(explanation, feature_names):
-    import shap
-
-    values = np.asarray(explanation.values)
-    data = np.asarray(explanation.data)
-    base_values = np.asarray(explanation.base_values)
-
-    if values.ndim == 3:
-        class_index = 1 if values.shape[2] > 1 else 0
-        values = values[:, :, class_index]
-        if base_values.ndim == 2:
-            base_values = base_values[:, class_index]
-        elif base_values.ndim == 1 and len(base_values) > 1:
-            base_values = np.repeat(base_values[class_index], values.shape[0])
-
-    return shap.Explanation(
-        values=values,
-        base_values=base_values,
-        data=data,
-        feature_names=list(feature_names),
-    )
+@st.cache_resource(show_spinner="Training models and calculating validation metrics...")
+def train_cached(mode: str, max_rows: int | None, fingerprint: str):
+    _, clean = get_data()
+    return evaluate_models(clean, mode=mode, max_rows=max_rows)
 
 
-try:
-    df = get_data()
-except Exception as exc:
-    st.error(f"Dataset yuklanmadi: {exc}")
-    st.code(
-        "Repository ichiga student-mat.csv faylini yoki "
-        "data/student-mat.csv faylini joylashtiring."
-    )
-    st.stop()
-
-# Early-warning setup: target=G3>=10, while G1/G2/G3 are excluded from X.
-X, y = prepare_features(df, include_prior_grades=False)
-cat_cols, num_cols = split_columns(X)
-preprocessor = get_preprocessor(cat_cols, num_cols)
-
-with st.sidebar:
-    st.title("🎓 Student ML")
-    st.markdown("**PDP University | 2026**")
-    st.markdown("**Eltezorov Doriyorbek**")
-    st.markdown("**Group: 22-305 | AI**")
-    st.divider()
-    page = st.radio(
-        "📌 Bo'limlar",
-        [
-            "🏠 Bosh sahifa",
-            "📊 EDA & Tahlil",
-            "⚡ Optuna Optimization",
-            "🤖 Model O'qitish",
-            "📈 Natijalar",
-            "🔬 SHAP Values",
-            "🔍 Bashorat",
-            "ℹ️ Model Card",
-        ],
-    )
-    st.divider()
-    st.caption(f"Dataset: {len(df)} qator")
-    st.caption(f"Model featurelari: {X.shape[1]}")
-    st.caption("Target: G3 ≥ 10 → Pass")
-    st.caption("G1, G2 va G3 modelga berilmaydi")
-
-bundle = st.session_state.get("training_bundle")
-
-# ════════════════════════════════════════
-# 🏠 BOSH SAHIFA
-# ════════════════════════════════════════
-if page == "🏠 Bosh sahifa":
-    st.title("🎓 Machine Learning Model Optimization")
-    st.subheader("Student Performance Prediction — Early Warning System")
-    st.divider()
-
-    best_name = bundle["best_model_name"] if bundle else "O'qitilmagan"
-    best_f1 = metric_mean(bundle, best_name, "F1") if bundle else None
-    best_auc = metric_mean(bundle, best_name, "AUC-ROC") if bundle else None
-
-    cols = st.columns(5)
-    cols[0].metric("👨‍🎓 O'quvchilar", len(df))
-    cols[1].metric("📚 Features", X.shape[1])
-    cols[2].metric("🤖 Modellar", len(get_models()))
-    cols[3].metric("🏆 Best F1", f"{best_f1:.3f}" if best_f1 is not None else "—")
-    cols[4].metric("📈 Best AUC", f"{best_auc:.3f}" if best_auc is not None else "—")
-
-    st.divider()
-    left, right = st.columns([1.15, 1])
-    with left:
-        st.markdown(
-            """
-            ### 📌 Loyiha nima qiladi?
-            Ilova o'quvchining yakuniy natijasi **Pass/Fail** bo'lishini oldindan
-            baholaydi. Modelga `G1`, `G2` va `G3` berilmaydi; shu sababli bu
-            yakuniy bahoni takrorlovchi kalkulyator emas, balki erta xavf aniqlash tizimidir.
-
-            ### 🔧 Metodlar
-            - 6 ta klassifikatsiya modeli
-            - 5-fold outer + 5-fold inner Nested Cross-Validation
-            - GridSearchCV va Optuna
-            - OOF ROC, Precision–Recall va Confusion Matrix
-            - Haqiqiy Wilcoxon testi
-            - SHAP global va local explanation
-            - Real pipeline orqali individual bashorat
-            """
-        )
-    with right:
-        st.markdown("### 📊 Holat")
-        if bundle:
-            preview = format_result_table(bundle)[["Rank", "Model", "F1", "AUC-ROC"]]
-            st.dataframe(preview, width="stretch", hide_index=True)
-            st.success(f"Eng yaxshi model: {best_name}")
+def load_data_panel():
+    st.sidebar.markdown("## 🏙️ Price Command Center")
+    st.sidebar.markdown("PDP University · BTEC Level 6")
+    with st.sidebar.expander("Dataset source", expanded=False):
+        path = find_dataset_path()
+        if path:
+            st.success(f"Found: {path.name}")
         else:
-            st.info(
-                "Natijalar hali hisoblanmagan. `🤖 Model O'qitish` bo'limiga o'tib "
-                "Nested CV jarayonini ishga tushiring."
-            )
-
-# ════════════════════════════════════════
-# 📊 EDA
-# ════════════════════════════════════════
-elif page == "📊 EDA & Tahlil":
-    st.title("📊 Exploratory Data Analysis")
-    st.divider()
-
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📈 Distribution", "🔗 Correlation", "📦 Boxplots", "📋 Dataset"]
-    )
-
-    with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            counts = df["target"].value_counts().reindex([0, 1], fill_value=0)
-            class_df = pd.DataFrame(
-                {"Class": ["Fail", "Pass"], "Count": counts.values}
-            )
-            fig = px.bar(
-                class_df,
-                x="Class",
-                y="Count",
-                color="Class",
-                text="Count",
-                title="Pass vs Fail Distribution",
-                color_discrete_map={"Fail": "#E74C3C", "Pass": "#2ECC71"},
-            )
-            fig.update_traces(textposition="outside")
-            st.plotly_chart(fig, width="stretch")
-
-        with col2:
-            if "G3" in df.columns:
-                fig = px.histogram(
-                    df,
-                    x="G3",
-                    nbins=20,
-                    title="Final Grade (G3) Distribution",
-                )
-                fig.add_vline(
-                    x=10,
-                    line_dash="dash",
-                    line_color="red",
-                    annotation_text="Pass threshold = 10",
-                )
-                st.plotly_chart(fig, width="stretch")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if "absences" in df.columns:
-                fig = px.histogram(
-                    df,
-                    x="absences",
-                    nbins=30,
-                    title="Absences Distribution",
-                )
-                st.plotly_chart(fig, width="stretch")
-        with col2:
-            pie_df = pd.DataFrame(
-                {
-                    "Class": df["target"].map({0: "Fail", 1: "Pass"}),
-                }
-            )
-            fig = px.pie(
-                pie_df,
-                names="Class",
-                title="Class Balance",
-                color="Class",
-                color_discrete_map={"Fail": "#E74C3C", "Pass": "#2ECC71"},
-            )
-            st.plotly_chart(fig, width="stretch")
-
-    with tab2:
-        numeric_df = df.select_dtypes(include=[np.number])
-        corr = numeric_df.corr()
-        fig, ax = plt.subplots(figsize=(14, 10))
-        sns.heatmap(
-            corr,
-            annot=True,
-            fmt=".2f",
-            cmap="coolwarm",
-            center=0,
-            linewidths=0.4,
-            annot_kws={"size": 7},
-            ax=ax,
-        )
-        ax.set_title("Correlation Heatmap")
-        st.pyplot(fig)
-        plt.close(fig)
-
-    with tab3:
-        available = [
-            col
-            for col in [
-                "studytime",
-                "failures",
-                "absences",
-                "Medu",
-                "Fedu",
-                "famrel",
-                "freetime",
-            ]
-            if col in df.columns
-        ]
-        feature = st.selectbox("Feature tanlang", available)
-        y_axis = "G3" if "G3" in df.columns else "target"
-        plot_df = df.copy()
-        plot_df["Class"] = plot_df["target"].map({0: "Fail", 1: "Pass"})
-        fig = px.box(
-            plot_df,
-            x=feature,
-            y=y_axis,
-            color="Class",
-            title=f"{feature} vs {y_axis}",
-            color_discrete_map={"Fail": "#E74C3C", "Pass": "#2ECC71"},
-        )
-        st.plotly_chart(fig, width="stretch")
-
-    with tab4:
-        st.dataframe(df.head(50), width="stretch", hide_index=True)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Rows", df.shape[0])
-        c2.metric("Columns", df.shape[1])
-        c3.metric("Missing cells", int(df.isna().sum().sum()))
-        st.download_button(
-            "📥 Dataset CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="student_dataset_with_target.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-# ════════════════════════════════════════
-# ⚡ OPTUNA
-# ════════════════════════════════════════
-elif page == "⚡ Optuna Optimization":
-    st.title("⚡ Optuna Hyperparameter Optimization")
-    st.divider()
-    st.info(
-        "Preprocessing har bir CV fold ichida bajariladi. Bu validation ma'lumotining "
-        "oldindan ko'rilib qolishini oldini oladi."
-    )
-
-    model_choice = st.selectbox(
-        "Model tanlang",
-        ["Logistic Regression", "Random Forest", "Gradient Boosting"],
-    )
-    n_trials = st.slider("Trials soni", 10, 100, 30, 5)
-
-    if st.button("🚀 Optuna Ishga Tushir", type="primary", width="stretch"):
-        import optuna
-
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-        progress = st.progress(0)
-        status = st.empty()
-
-        def objective(trial):
-            if model_choice == "Logistic Regression":
-                params = {
-                    "C": trial.suggest_float("C", 1e-3, 100.0, log=True),
-                    "l1_ratio": trial.suggest_categorical("l1_ratio", [0.0, 1.0]),
-                }
-            elif model_choice == "Random Forest":
-                params = {
-                    "n_estimators": trial.suggest_int("n_estimators", 80, 350, step=10),
-                    "max_depth": trial.suggest_int("max_depth", 3, 20),
-                    "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
-                }
-            else:
-                params = {
-                    "n_estimators": trial.suggest_int("n_estimators", 50, 300, step=10),
-                    "learning_rate": trial.suggest_float(
-                        "learning_rate", 0.01, 0.3, log=True
-                    ),
-                    "max_depth": trial.suggest_int("max_depth", 2, 6),
-                    "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
-                }
-
-            estimator = build_optuna_estimator(model_choice, params)
-            pipe = Pipeline(
-                [
-                    ("pre", clone(preprocessor)),
-                    ("clf", estimator),
-                ]
-            )
-            scores = cross_val_score(
-                pipe,
-                X,
-                y,
-                cv=cv,
-                scoring="f1",
-                n_jobs=1,
-                error_score="raise",
-            )
-            return float(scores.mean())
-
-        def callback(study, trial):
-            done = trial.number + 1
-            progress.progress(min(done / n_trials, 1.0))
-            status.text(
-                f"Trial {done}/{n_trials} — Best F1: {study.best_value:.4f}"
-            )
-
-        sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE)
-        study = optuna.create_study(direction="maximize", sampler=sampler)
-        try:
-            study.optimize(objective, n_trials=n_trials, callbacks=[callback], n_jobs=1)
-        except Exception as exc:
-            st.error(f"Optuna jarayonida xato: {exc}")
+            st.warning("No local dataset found. Upload an Excel file below.")
+        uploaded = st.file_uploader("Upload OLX dataset", type=["xlsx", "xls", "csv", "pkl"])
+        if uploaded:
+            st.session_state["uploaded_dataset_bytes"] = uploaded.getvalue()
+            st.session_state["uploaded_dataset_name"] = uploaded.name
+            st.success(f"Uploaded: {uploaded.name}")
+    try:
+        if "uploaded_dataset_bytes" in st.session_state:
+            raw, df = get_data(st.session_state["uploaded_dataset_bytes"], st.session_state.get("uploaded_dataset_name"))
         else:
-            best_estimator = build_optuna_estimator(model_choice, study.best_params)
-            best_pipe = Pipeline(
-                [
-                    ("pre", clone(preprocessor)),
-                    ("clf", best_estimator),
-                ]
-            )
-            best_pipe.fit(X, y)
-            st.session_state.setdefault("optuna_models", {})[model_choice] = best_pipe
-            st.session_state["last_optuna_study"] = study
-
-            progress.progress(1.0)
-            status.empty()
-            st.success("Optuna tugadi.")
-            c1, c2 = st.columns(2)
-            c1.metric("🏆 Eng yaxshi CV F1", f"{study.best_value:.4f}")
-            c2.metric("Trials", len(study.trials))
-            st.json(study.best_params)
-
-            trials_df = study.trials_dataframe(
-                attrs=("number", "value", "params", "state")
-            )
-            st.dataframe(trials_df, width="stretch", hide_index=True)
-
-            history = pd.DataFrame(
-                {
-                    "Trial": [t.number + 1 for t in study.trials],
-                    "F1": [t.value for t in study.trials],
-                }
-            )
-            fig = px.line(
-                history,
-                x="Trial",
-                y="F1",
-                markers=True,
-                title="Optuna Trial History",
-            )
-            fig.add_hline(
-                y=study.best_value,
-                line_dash="dash",
-                annotation_text="Best",
-            )
-            st.plotly_chart(fig, width="stretch")
-
-            try:
-                importance = optuna.importance.get_param_importances(study)
-                imp_df = pd.DataFrame(
-                    {"Parameter": importance.keys(), "Importance": importance.values()}
-                ).sort_values("Importance")
-                fig = px.bar(
-                    imp_df,
-                    x="Importance",
-                    y="Parameter",
-                    orientation="h",
-                    title="Hyperparameter Importance",
-                )
-                st.plotly_chart(fig, width="stretch")
-            except Exception:
-                st.caption("Parameter importance hisoblash uchun trials yetarli emas.")
-
-# ════════════════════════════════════════
-# 🤖 MODEL O'QITISH
-# ════════════════════════════════════════
-elif page == "🤖 Model O'qitish":
-    st.title("🤖 Model O'qitish — Nested Cross-Validation")
-    st.divider()
-    st.warning(
-        "6 model × 5 outer fold × 5 inner fold hisoblanadi. Streamlit Cloud'da "
-        "bir necha daqiqa vaqt olishi mumkin."
-    )
-
-    if st.button("🚀 Modellarni O'qitish", type="primary", width="stretch"):
-        progress = st.progress(0)
-        status = st.empty()
-        total_models = len(get_models())
-        outer_splits = 5
-
-        def update_progress(name, model_idx, models_count, fold_idx, folds_count):
-            completed = (model_idx - 1) * folds_count + (fold_idx - 1)
-            total = models_count * folds_count
-            progress.progress(min(completed / total, 0.99))
-            status.text(
-                f"{name}: outer fold {fold_idx}/{folds_count} "
-                f"({model_idx}/{models_count} model)"
-            )
-
-        try:
-            trained = train_models(
-                X,
-                y,
-                preprocessor,
-                outer_splits=outer_splits,
-                inner_splits=5,
-                progress_callback=update_progress,
-            )
-        except Exception as exc:
-            st.error(f"Model o'qitishda xato: {exc}")
-        else:
-            st.session_state["training_bundle"] = trained
-            bundle = trained
-            progress.progress(1.0)
-            status.empty()
-            st.success("Barcha modellar o'qitildi.")
-
-    bundle = st.session_state.get("training_bundle")
-    if bundle:
-        best_name = bundle["best_model_name"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Best model", best_name)
-        c2.metric("Best F1", f"{metric_mean(bundle, best_name, 'F1'):.3f}")
-        c3.metric("Best AUC", f"{metric_mean(bundle, best_name, 'AUC-ROC'):.3f}")
-
-        st.subheader("Fold-by-Fold F1")
-        fold_df = bundle["fold_metrics"]
-        fig = px.line(
-            fold_df,
-            x="Fold",
-            y="F1",
-            color="Model",
-            markers=True,
-            title="F1 Score — Outer Folds",
-        )
-        st.plotly_chart(fig, width="stretch")
-
-        best_model = bundle["best_pipes"][best_name]
-        st.download_button(
-            "📦 Eng yaxshi modelni yuklab olish",
-            data=model_to_bytes(best_model),
-            file_name="best_student_model.joblib",
-            mime="application/octet-stream",
-            width="stretch",
-        )
-
-# ════════════════════════════════════════
-# 📈 NATIJALAR
-# ════════════════════════════════════════
-elif page == "📈 Natijalar":
-    st.title("📈 Model Natijalari")
-    st.divider()
-
-    if not bundle:
-        st.warning("Avval `🤖 Model O'qitish` bo'limida modellarni o'qiting.")
+            raw, df = get_data()
+    except Exception as exc:
+        st.error("Dataset could not be loaded.")
+        st.info("Expected a valid OLX Excel workbook, not a Python script renamed as .xlsx. The safest file name is `olx_massive_real_estate.xlsx` in the repository root.")
+        st.exception(exc)
         st.stop()
+    return raw, df
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        [
-            "🏆 Leaderboard",
-            "📊 Metrics",
-            "📉 ROC & PR",
-            "🧩 Confusion Matrix",
-            "🧪 Wilcoxon",
-        ]
-    )
 
-    model_names = list(bundle["results"].keys())
-    best_name = bundle["best_model_name"]
+raw_df, df = load_data_panel()
+summary = market_summary(df)
 
+pages = {
+    "Operate": ["🏠 Overview", "📊 Data Audit", "🤖 Model Lab", "📈 Results"],
+    "Use": ["💰 Price Prediction", "🎛️ Scenario Simulator", "🧭 Market Insights"],
+    "Trust": ["🧪 Validation", "🔎 Explainability", "📋 Evidence Room"],
+}
+choices = []
+st.sidebar.markdown("---")
+for group, items in pages.items():
+    st.sidebar.markdown(f"**{group.upper()}**")
+    for item in items:
+        choices.append(item)
+page = st.sidebar.radio("Navigation", choices, label_visibility="collapsed")
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Rows after cleaning: {len(df):,}")
+st.sidebar.caption(f"Dataset fingerprint: {dataset_fingerprint(df)}")
+st.sidebar.caption("Target: asking price in UZS")
+
+res = st.session_state.get("experiment")
+best = res.get("best_model_name") if res else "Run training"
+mae = money(float(res["leaderboard"].iloc[0]["MAE"])) if res else "—"
+r2 = f"{float(res['leaderboard'].iloc[0]['R2']):.3f}" if res else "—"
+st.markdown(f"""
+<div class='card' style='position:sticky;top:.4rem;z-index:99;padding:.7rem 1rem;display:flex;gap:.75rem;flex-wrap:wrap;align-items:center'>
+ <b>🏙️ Tashkent Property Price Command Center</b>
+ <span class='step'>Experiment: {'Ready' if res else 'Not trained'}</span>
+ <span class='step'>Best model: {best}</span>
+ <span class='step'>MAE: {mae}</span>
+ <span class='step'>R²: {r2}</span>
+</div>
+""", unsafe_allow_html=True)
+
+if page == "🏠 Overview":
+    hero()
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: metric_card("Clean listings", f"{summary['rows']:,}", "after quality filters")
+    with c2: metric_card("Districts", str(summary["districts"]), "market segments")
+    with c3: metric_card("Median price", money(summary["median_price"]), "asking price")
+    with c4: metric_card("Median price/m²", money(summary["median_price_per_sqm"]), "valuation anchor")
+    with c5: metric_card("Features", str(summary["features"]), "model inputs")
+
+    angle = st.radio("Presentation angle", ["Executive story", "Technical proof", "Viva defence"], horizontal=True)
+    if angle == "Executive story":
+        st.markdown("""<div class='card soft'><h3>From scraped listings to valuation support</h3><p>The project turns noisy OLX apartment listings into a structured valuation command center. It is designed for transparent exploration rather than blind price prediction.</p></div>""", unsafe_allow_html=True)
+    elif angle == "Technical proof":
+        st.markdown("""<div class='card soft'><h3>Methodological focus</h3><p>The pipeline removes identifiers, parses string prices and areas, avoids district target encoding leakage and evaluates models against a dummy median baseline using interpretable error metrics.</p></div>""", unsafe_allow_html=True)
+    else:
+        st.markdown("""<div class='card soft'><h3>Defence position</h3><p>The prototype does not claim to predict transaction prices perfectly. It estimates asking prices and exposes uncertainty, outliers, feature drivers and practical limitations.</p></div>""", unsafe_allow_html=True)
+
+    st.markdown("### Command workflow")
+    st.markdown("""<div class='workflow'><span class='step'>1 · Data audit</span><span class='step'>2 · Clean pipeline</span><span class='step'>3 · Model lab</span><span class='step'>4 · Validation</span><span class='step'>5 · Prediction</span><span class='step'>6 · Scenario simulation</span><span class='step'>7 · Evidence export</span></div>""", unsafe_allow_html=True)
+
+elif page == "📊 Data Audit":
+    st.title("📊 Data Audit")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: metric_card("Raw rows", f"{len(raw_df):,}")
+    with c2: metric_card("Clean rows", f"{len(df):,}")
+    with c3: metric_card("Dropped rows", f"{len(raw_df)-len(df):,}")
+    with c4: metric_card("Features", str(len(PREFERRED_FEATURES)))
+    tab1, tab2, tab3, tab4 = st.tabs(["Target", "Missingness", "Outliers", "Data sample"])
     with tab1:
-        leaderboard = format_result_table(bundle)
-        st.dataframe(leaderboard, width="stretch", hide_index=True)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("🥇 Best Model", best_name)
-        c2.metric(
-            "🏆 Best F1",
-            f"{metric_mean(bundle, best_name, 'F1'):.3f} ± "
-            f"{metric_std(bundle, best_name, 'F1'):.3f}",
-        )
-        c3.metric(
-            "📈 Best AUC",
-            f"{metric_mean(bundle, best_name, 'AUC-ROC'):.3f} ± "
-            f"{metric_std(bundle, best_name, 'AUC-ROC'):.3f}",
-        )
-
-        export_df = leaderboard.copy()
-        st.download_button(
-            "📥 Natijalarni CSV yuklab olish",
-            data=export_df.to_csv(index=False).encode("utf-8"),
-            file_name="nested_cv_results.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
+        fig = px.histogram(df, x=TARGET, nbins=60, title="Distribution of cleaned asking prices")
+        st.plotly_chart(fig, width="stretch")
+        fig2 = px.histogram(df, x="price_per_sqm", nbins=60, title="Distribution of price per square metre")
+        st.plotly_chart(fig2, width="stretch")
     with tab2:
-        metric = st.selectbox(
-            "Metric",
-            ["Accuracy", "Precision", "Recall", "F1", "AUC-ROC"],
-        )
-        metric_df = pd.DataFrame(
-            {
-                "Model": model_names,
-                "Mean": [metric_mean(bundle, name, metric) for name in model_names],
-                "Std": [metric_std(bundle, name, metric) for name in model_names],
-            }
-        ).sort_values("Mean", ascending=False)
-
-        fig = go.Figure(
-            go.Bar(
-                x=metric_df["Model"],
-                y=metric_df["Mean"],
-                error_y={"type": "data", "array": metric_df["Std"]},
-                text=[f"{value:.3f}" for value in metric_df["Mean"]],
-                textposition="outside",
-            )
-        )
-        fig.update_layout(title=f"{metric} Taqqoslash", yaxis_range=[0, 1.08])
-        st.plotly_chart(fig, width="stretch")
-
-        st.subheader("Top 3 Radar Chart")
-        categories = ["Accuracy", "Precision", "Recall", "F1", "AUC-ROC"]
-        top3 = format_result_table(bundle)["Model"].head(3).tolist()
-        radar = go.Figure()
-        for name in top3:
-            values = [metric_mean(bundle, name, item) for item in categories]
-            radar.add_trace(
-                go.Scatterpolar(
-                    r=values + [values[0]],
-                    theta=categories + [categories[0]],
-                    fill="toself",
-                    name=name,
-                )
-            )
-        radar.update_layout(
-            polar={"radialaxis": {"visible": True, "range": [0, 1]}},
-            title="Top 3 Models",
-        )
-        st.plotly_chart(radar, width="stretch")
-
+        miss = raw_df.isna().mean().mul(100).sort_values(ascending=False).reset_index()
+        miss.columns = ["column", "missing_percent"]
+        st.dataframe(miss, width="stretch")
+        st.download_button("Download missingness audit", miss.to_csv(index=False), "missingness_audit.csv")
     with tab3:
-        selected_models = st.multiselect(
-            "Modellar",
-            model_names,
-            default=model_names,
-        )
-        roc_fig = go.Figure()
-        pr_fig = go.Figure()
-
-        for name in selected_models:
-            pred_data = bundle["oof"][name]
-            y_true = pred_data["y_true"]
-            y_prob = pred_data["y_prob"]
-
-            fpr, tpr, _ = roc_curve(y_true, y_prob)
-            roc_auc = auc(fpr, tpr)
-            roc_fig.add_trace(
-                go.Scatter(
-                    x=fpr,
-                    y=tpr,
-                    mode="lines",
-                    name=f"{name} (AUC={roc_auc:.3f})",
-                )
-            )
-
-            precision, recall, _ = precision_recall_curve(y_true, y_prob)
-            pr_auc = auc(recall, precision)
-            pr_fig.add_trace(
-                go.Scatter(
-                    x=recall,
-                    y=precision,
-                    mode="lines",
-                    name=f"{name} (AUC={pr_auc:.3f})",
-                )
-            )
-
-        roc_fig.add_trace(
-            go.Scatter(
-                x=[0, 1],
-                y=[0, 1],
-                mode="lines",
-                name="Random",
-                line={"dash": "dash"},
-            )
-        )
-        roc_fig.update_layout(
-            title="Out-of-Fold ROC Curves",
-            xaxis_title="False Positive Rate",
-            yaxis_title="True Positive Rate",
-        )
-        pr_fig.update_layout(
-            title="Out-of-Fold Precision–Recall Curves",
-            xaxis_title="Recall",
-            yaxis_title="Precision",
-        )
-        st.plotly_chart(roc_fig, width="stretch")
-        st.plotly_chart(pr_fig, width="stretch")
-
+        st.markdown("The cleaning pipeline clips impossible room and floor values, filters extreme price-per-square-metre cases and keeps the modelling task focused on apartments with usable price and area fields.")
+        st.dataframe(df[["district", TARGET, "total_area", "price_per_sqm", "number_of_rooms", "floor", "total_floors"]].head(100), width="stretch")
     with tab4:
-        selected = st.selectbox("Model", model_names, index=model_names.index(best_name))
-        threshold = st.slider("Probability threshold", 0.10, 0.90, 0.50, 0.05)
-        pred_data = bundle["oof"][selected]
-        y_pred_threshold = (pred_data["y_prob"] >= threshold).astype(int)
-        cm = confusion_matrix(pred_data["y_true"], y_pred_threshold)
+        st.dataframe(df[PREFERRED_FEATURES + [TARGET, "price_per_sqm"]].head(100), width="stretch")
+        st.download_button("Download cleaned sample", df.head(500).to_csv(index=False), "cleaned_sample.csv")
 
-        fig = px.imshow(
-            cm,
-            text_auto=True,
-            x=["Predicted Fail", "Predicted Pass"],
-            y=["Actual Fail", "Actual Pass"],
-            title=f"{selected} — Confusion Matrix",
-            labels={"x": "Prediction", "y": "Actual", "color": "Count"},
-        )
+elif page == "🤖 Model Lab":
+    st.title("🤖 Model Lab")
+    mode = st.radio("Computation mode", ["quick", "full"], format_func=lambda x: "Quick · 3-fold CV" if x == "quick" else "Full · 5-fold CV", horizontal=True)
+    max_rows = st.slider("Maximum training rows", 3000, min(30000, len(df)), min(12000, len(df)), 1000)
+    st.info("Start with Quick mode. Use Full mode only after the app is stable, because Streamlit Cloud has limited resources.")
+    if st.button("🚀 Train and evaluate candidate models", type="primary", width="stretch"):
+        with st.spinner("Training candidate models..."):
+            st.session_state["experiment"] = train_cached(mode, int(max_rows), dataset_fingerprint(df))
+        st.success("Experiment completed. Open Results, Validation and Evidence Room.")
+        st.rerun()
+    if res:
+        c1, c2, c3 = st.columns(3)
+        with c1: metric_card("Best model", res["best_model_name"])
+        with c2: metric_card("MAE", money(float(res["leaderboard"].iloc[0]["MAE"])))
+        with c3: metric_card("Within 20%", pct(float(res["leaderboard"].iloc[0]["Within_20pct"])))
+        st.dataframe(res["leaderboard"], width="stretch")
+        st.download_button("Download best model", save_model(res["best_model"]), "best_house_price_model.joblib")
+
+elif page == "📈 Results":
+    st.title("📈 Model Results")
+    if not res:
+        st.warning("Run Model Lab first.")
+        st.stop()
+    lb = res["leaderboard"].copy()
+    tab1, tab2, tab3 = st.tabs(["Leaderboard", "Actual vs predicted", "Fold metrics"])
+    with tab1:
+        st.dataframe(lb, width="stretch")
+        fig = px.bar(lb, x="Model", y="MAE", title="Lower MAE is better")
         st.plotly_chart(fig, width="stretch")
-        st.caption(
-            "Thresholdni pasaytirish Fail xavfidagi o'quvchilarni ko'proq ushlashi "
-            "mumkin, lekin false alarm sonini ham oshiradi."
-        )
+        st.download_button("Download leaderboard", lb.to_csv(index=False), "leaderboard.csv")
+    with tab2:
+        pred = res["best_predictions"].copy()
+        fig = px.scatter(pred, x="actual", y="predicted", title=f"Actual vs predicted — {res['best_model_name']}")
+        lo = float(min(pred["actual"].min(), pred["predicted"].min()))
+        hi = float(max(pred["actual"].max(), pred["predicted"].max()))
+        fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="Ideal"))
+        st.plotly_chart(fig, width="stretch")
+        residual = pred.assign(error=pred["predicted"] - pred["actual"], abs_error=lambda d: np.abs(d["error"]))
+        fig2 = px.histogram(residual, x="error", nbins=60, title="Residual distribution")
+        st.plotly_chart(fig2, width="stretch")
+    with tab3:
+        st.dataframe(res["fold_metrics"], width="stretch")
 
-    with tab5:
-        left, right = st.columns(2)
-        model_a = left.selectbox("Model A", model_names, index=0)
-        model_b_options = [name for name in model_names if name != model_a]
-        model_b = right.selectbox("Model B", model_b_options, index=0)
+elif page == "💰 Price Prediction":
+    st.title("💰 Price Prediction")
+    if not res:
+        st.warning("Run Model Lab first, then return to this page.")
+        st.stop()
+    left, right = st.columns([1, 1])
+    with left:
+        st.subheader("Property profile")
+        vals = {}
+        for col in ["district", "type_of_market", "house_type", "repairs", "furnished", "layout"]:
+            options = sorted([str(x) for x in df[col].dropna().unique()])[:100]
+            default = options.index(str(df[col].mode().iloc[0])) if str(df[col].mode().iloc[0]) in options else 0
+            vals[col] = st.selectbox(col, options, index=default)
+        vals["number_of_rooms"] = st.slider("number_of_rooms", 1, 8, int(df["number_of_rooms"].median()))
+        vals["total_area"] = st.number_input("total_area m²", 15.0, 500.0, float(df["total_area"].median()), 1.0)
+        vals["floor"] = st.slider("floor", 1, 60, int(df["floor"].median()))
+        vals["total_floors"] = st.slider("total_floors", 1, 80, int(df["total_floors"].median()))
+        vals["ceiling_height"] = st.number_input("ceiling_height m", 2.0, 6.0, float(df["ceiling_height"].median()) if df["ceiling_height"].notna().any() else 2.8, 0.1)
+    with right:
+        st.subheader("Estimate")
+        all_vals = prepare_prediction_features(df, vals)
+        if st.button("Estimate asking price", type="primary", width="stretch"):
+            price = predict_single(res["best_model"], all_vals)
+            sqm = price / max(float(all_vals["total_area"]), 1)
+            metric_card("Estimated asking price", money(price), f"{money(sqm)} per m²")
+            bench = district_benchmark(df)
+            row = bench[bench["district"].astype(str) == str(all_vals["district"])]
+            if not row.empty:
+                median = float(row.iloc[0]["median_price"])
+                delta = (price - median) / median
+                st.info(f"Compared with the district median, this estimate is {delta:+.1%} different.")
+            rec = pd.DataFrame([{**all_vals, "estimated_price_uzs": price, "estimated_price_per_sqm": sqm, "model": res["best_model_name"]}])
+            st.download_button("Download prediction record", rec.to_csv(index=False), "prediction_record.csv")
 
-        a_scores = bundle["f1_arrays"][model_a]
-        b_scores = bundle["f1_arrays"][model_b]
-        comparison_df = pd.DataFrame(
-            {
-                "Fold": np.arange(1, len(a_scores) + 1),
-                model_a: a_scores,
-                model_b: b_scores,
-            }
-        )
-        st.dataframe(comparison_df, width="stretch", hide_index=True)
+elif page == "🎛️ Scenario Simulator":
+    st.title("🎛️ Scenario Simulator")
+    if not res:
+        st.warning("Run Model Lab first.")
+        st.stop()
+    st.markdown("Simulate how the model reacts when valuation variables change. This is not causal proof; it is a decision-support sensitivity analysis.")
+    base = {
+        "district": str(df["district"].mode().iloc[0]),
+        "type_of_market": str(df["type_of_market"].mode().iloc[0]),
+        "house_type": str(df["house_type"].mode().iloc[0]),
+        "repairs": str(df["repairs"].mode().iloc[0]),
+        "furnished": str(df["furnished"].mode().iloc[0]),
+        "layout": str(df["layout"].mode().iloc[0]),
+        "number_of_rooms": int(df["number_of_rooms"].median()),
+        "total_area": float(df["total_area"].median()),
+        "floor": int(df["floor"].median()),
+        "total_floors": int(df["total_floors"].median()),
+        "ceiling_height": float(df["ceiling_height"].median()) if df["ceiling_height"].notna().any() else 2.8,
+    }
+    area_change = st.slider("Area change (%)", -30, 60, 0, 5)
+    room_change = st.slider("Room count change", -2, 3, 0)
+    floor_position = st.select_slider("Floor position scenario", options=["first floor", "middle floor", "top floor"], value="middle floor")
+    repair_upgrade = st.selectbox("Repair scenario", sorted(df["repairs"].dropna().astype(str).unique())[:50])
+    scenarios = []
+    for name, modifier in [
+        ("Current profile", {}),
+        ("Larger area scenario", {"total_area": base["total_area"] * (1 + area_change / 100)}),
+        ("Room layout scenario", {"number_of_rooms": max(1, base["number_of_rooms"] + room_change)}),
+        ("Repair upgrade scenario", {"repairs": repair_upgrade}),
+    ]:
+        vals = base.copy(); vals.update(modifier)
+        if floor_position == "first floor": vals["floor"] = 1
+        if floor_position == "top floor": vals["floor"] = vals["total_floors"]
+        if floor_position == "middle floor": vals["floor"] = max(2, int(vals["total_floors"] // 2))
+        vals = prepare_prediction_features(df, vals)
+        scenarios.append({"scenario": name, "estimated_price": predict_single(res["best_model"], vals)})
+    scen = pd.DataFrame(scenarios)
+    base_price = float(scen.iloc[0]["estimated_price"])
+    scen["delta_vs_current"] = scen["estimated_price"] - base_price
+    scen["delta_pct"] = scen["delta_vs_current"] / base_price
+    st.dataframe(scen.assign(estimated_price=scen["estimated_price"].map(money), delta_vs_current=scen["delta_vs_current"].map(money), delta_pct=scen["delta_pct"].map(lambda x: f"{x:+.1%}")), width="stretch")
+    fig = px.bar(scen, x="scenario", y="estimated_price", title="Scenario valuation comparison")
+    st.plotly_chart(fig, width="stretch")
+    st.download_button("Download scenario analysis", scen.to_csv(index=False), "scenario_analysis.csv")
 
-        try:
-            statistic, p_value = wilcoxon(a_scores, b_scores)
-            c1, c2 = st.columns(2)
-            c1.metric("Wilcoxon statistic", f"{statistic:.4f}")
-            c2.metric("p-value", f"{p_value:.4f}")
-            if p_value < 0.05:
-                st.success("Fold F1 natijalari orasida statistik ahamiyatli farq bor.")
-            else:
-                st.info(
-                    "Statistik ahamiyatli farq aniqlanmadi. Bu modellar mutlaqo "
-                    "bir xil degani emas; 5 ta fold test kuchini cheklaydi."
-                )
-        except ValueError as exc:
-            st.warning(f"Wilcoxon hisoblanmadi: {exc}")
+elif page == "🧭 Market Insights":
+    st.title("🧭 Market Insights")
+    bench = district_benchmark(df)
+    st.dataframe(bench, width="stretch")
+    fig = px.bar(bench.head(15), x="district", y="median_price_sqm", title="Top districts by median price per m²")
+    st.plotly_chart(fig, width="stretch")
+    fig2 = px.box(df, x="district", y=TARGET, title="Price distribution by district")
+    fig2.update_xaxes(tickangle=45)
+    st.plotly_chart(fig2, width="stretch")
 
-# ════════════════════════════════════════
-# 🔬 SHAP
-# ════════════════════════════════════════
-elif page == "🔬 SHAP Values":
-    st.title("🔬 SHAP Values — Model Tushuntirish")
-    st.divider()
-    st.info(
-        "SHAP uchun Gradient Boosting ishlatiladi. Global grafiklar umumiy ta'sirni, "
-        "waterfall esa bitta o'quvchi bashoratini tushuntiradi."
-    )
+elif page == "🧪 Validation":
+    st.title("🧪 Validation and Reliability")
+    if not res:
+        st.warning("Run Model Lab first.")
+        st.stop()
+    pred = res["best_predictions"]
+    ci = bootstrap_metric_ci(pred["actual"], pred["predicted"])
+    st.dataframe(ci, width="stretch")
+    fig = px.bar(ci, x="metric", y="estimate", error_y=ci["ci_high"]-ci["estimate"], error_y_minus=ci["estimate"]-ci["ci_low"], title="Bootstrap 95% confidence intervals")
+    st.plotly_chart(fig, width="stretch")
+    if st.button("Calculate learning curve", width="stretch"):
+        lc = learning_curve_table(res["best_model"], df.sample(min(len(df), 12000), random_state=42))
+        st.session_state["learning_curve"] = lc
+    if "learning_curve" in st.session_state:
+        lc = st.session_state["learning_curve"]
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=lc["train_size"], y=lc["train_mae"], mode="lines+markers", name="Training MAE"))
+        fig2.add_trace(go.Scatter(x=lc["train_size"], y=lc["validation_mae"], mode="lines+markers", name="Validation MAE"))
+        fig2.update_layout(title="Learning curve", xaxis_title="Training rows", yaxis_title="MAE")
+        st.plotly_chart(fig2, width="stretch")
 
-    sample_size = st.slider("SHAP sample soni", 30, min(200, len(X)), min(100, len(X)), 10)
+elif page == "🔎 Explainability":
+    st.title("🔎 Explainability")
+    if not res:
+        st.warning("Run Model Lab first.")
+        st.stop()
+    X, y = split_xy(df)
+    if st.button("Calculate permutation importance", type="primary"):
+        with st.spinner("Calculating feature importance..."):
+            st.session_state["importance"] = model_feature_importance(res["best_model"], X, y)
+    if "importance" in st.session_state:
+        imp = st.session_state["importance"]
+        st.dataframe(imp, width="stretch")
+        fig = px.bar(imp.head(20), x="importance_mae_increase", y="feature", orientation="h", title="Permutation importance: MAE increase when feature is shuffled")
+        fig.update_layout(yaxis={"categoryorder":"total ascending"})
+        st.plotly_chart(fig, width="stretch")
+        st.download_button("Download feature importance", imp.to_csv(index=False), "feature_importance.csv")
 
-    if st.button("🔬 SHAP Hisoblash", type="primary", width="stretch"):
-        import shap
-
-        with st.spinner("SHAP hisoblanmoqda..."):
-            if bundle and "Gradient Boosting" in bundle["best_pipes"]:
-                shap_pipe = bundle["best_pipes"]["Gradient Boosting"]
-            else:
-                shap_pipe = Pipeline(
-                    [
-                        ("pre", clone(preprocessor)),
-                        (
-                            "clf",
-                            GradientBoostingClassifier(
-                                n_estimators=120,
-                                learning_rate=0.05,
-                                max_depth=2,
-                                random_state=RANDOM_STATE,
-                            ),
-                        ),
-                    ]
-                )
-                shap_pipe.fit(X, y)
-
-            X_sample = X.sample(
-                n=min(sample_size, len(X)), random_state=RANDOM_STATE
-            )
-            pre = shap_pipe.named_steps["pre"]
-            clf = shap_pipe.named_steps["clf"]
-            X_processed = np.asarray(pre.transform(X_sample))
-            feature_names = pre.get_feature_names_out()
-
-            background_size = min(100, len(X_processed))
-            background = X_processed[:background_size]
-            explainer = shap.Explainer(
-                clf,
-                background,
-                feature_names=feature_names,
-            )
-            explanation = explainer(X_processed)
-            explanation = normalize_shap_explanation(explanation, feature_names)
-
-            st.session_state["shap_explanation"] = explanation
-            st.session_state["shap_rows"] = X_sample.reset_index(drop=True)
-
-        st.success("SHAP hisoblandi.")
-
-    if "shap_explanation" in st.session_state:
-        import shap
-
-        explanation = st.session_state["shap_explanation"]
-        shap_rows = st.session_state["shap_rows"]
-
-        st.subheader("Global Feature Importance")
-        plt.figure(figsize=(10, 7))
-        shap.plots.bar(explanation, max_display=15, show=False)
-        fig = plt.gcf()
-        st.pyplot(fig)
-        plt.close(fig)
-
-        st.subheader("SHAP Beeswarm")
-        plt.figure(figsize=(10, 7))
-        shap.plots.beeswarm(explanation, max_display=15, show=False)
-        fig = plt.gcf()
-        st.pyplot(fig)
-        plt.close(fig)
-
-        st.subheader("Bitta o'quvchi uchun Local Explanation")
-        row_number = st.slider(
-            "Sample qatori",
-            1,
-            len(shap_rows),
-            1,
-        )
-        st.dataframe(
-            shap_rows.iloc[[row_number - 1]],
-            width="stretch",
-            hide_index=True,
-        )
-        plt.figure(figsize=(10, 7))
-        shap.plots.waterfall(
-            explanation[row_number - 1],
-            max_display=15,
-            show=False,
-        )
-        fig = plt.gcf()
-        st.pyplot(fig)
-        plt.close(fig)
-
-# ════════════════════════════════════════
-# 🔍 BASHORAT
-# ════════════════════════════════════════
-elif page == "🔍 Bashorat":
-    st.title("🔍 O'quvchi Natijasini Bashorat Qilish")
-    st.divider()
-
-    if bundle:
-        prediction_model_name = bundle["best_model_name"]
-        prediction_model = bundle["best_pipes"][prediction_model_name]
-        model_source = "Nested CV'dan keyingi eng yaxshi tuned pipeline"
-    elif st.session_state.get("optuna_models"):
-        prediction_model_name = next(iter(st.session_state["optuna_models"]))
-        prediction_model = st.session_state["optuna_models"][prediction_model_name]
-        model_source = "Optuna orqali o'qitilgan pipeline"
+elif page == "📋 Evidence Room":
+    st.title("📋 Evidence Room")
+    st.markdown("""<div class='card soft'><h3>Evidence position</h3><p>The app is designed as a BTEC-style artefact: it contains a data pipeline, model comparison, validation diagnostics, explainability, scenario analysis and exportable evidence. It is stronger than a static notebook because the examiner can interact with the full workflow.</p></div>""", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1: metric_card("Dataset fingerprint", dataset_fingerprint(df))
+    with c2: metric_card("Environment", environment_metadata()["python"], "Python")
+    with c3: metric_card("Current evidence", "Ready" if res else "Train first")
+    if res:
+        st.download_button("Download complete evidence pack", evidence_pack(res, df), "house_price_evidence_pack.zip", mime="application/zip", width="stretch")
+        model_card = {
+            "project": APP_NAME,
+            "target": "apartment asking price in UZS",
+            "best_model": res["best_model_name"],
+            "rows_cleaned": len(df),
+            "limitations": ["OLX asking prices are not final transaction prices", "scraped listings can contain noise", "local validation is required before business use"],
+            "environment": environment_metadata(),
+        }
+        st.download_button("Download model card JSON", json.dumps(model_card, indent=2), "model_card.json")
     else:
-        prediction_model_name = "Logistic Regression (default)"
-        prediction_model = get_cached_default_model(X, y)
-        model_source = "Tezkor default pipeline; to'liq taqqoslash hali bajarilmagan"
-
-    st.info(f"Model: **{prediction_model_name}** — {model_source}")
-    threshold = st.slider("Qaror thresholdi", 0.10, 0.90, 0.50, 0.05)
-
-    inputs = {}
-    with st.form("prediction_form"):
-        columns = st.columns(3)
-        for idx, feature in enumerate(X.columns):
-            container = columns[idx % 3]
-            series = X[feature].dropna()
-
-            with container:
-                if feature in cat_cols:
-                    options = series.unique().tolist()
-                    mode = series.mode().iloc[0] if not series.mode().empty else options[0]
-                    default_index = options.index(mode) if mode in options else 0
-                    inputs[feature] = st.selectbox(
-                        feature,
-                        options,
-                        index=default_index,
-                        key=f"pred_{feature}",
-                    )
-                else:
-                    numeric = pd.to_numeric(series, errors="coerce").dropna()
-                    minimum = float(numeric.min())
-                    maximum = float(numeric.max())
-                    median = float(numeric.median())
-                    is_integer = pd.api.types.is_integer_dtype(X[feature].dtype)
-                    unique_values = sorted(numeric.unique().tolist())
-
-                    if is_integer and len(unique_values) <= 20:
-                        values = [int(value) for value in unique_values]
-                        default = int(round(median))
-                        default_index = (
-                            values.index(default)
-                            if default in values
-                            else min(range(len(values)), key=lambda i: abs(values[i] - default))
-                        )
-                        inputs[feature] = st.selectbox(
-                            feature,
-                            values,
-                            index=default_index,
-                            key=f"pred_{feature}",
-                        )
-                    else:
-                        step = 1.0 if is_integer else 0.1
-                        value = int(round(median)) if is_integer else median
-                        chosen = st.number_input(
-                            feature,
-                            min_value=int(minimum) if is_integer else minimum,
-                            max_value=int(maximum) if is_integer else maximum,
-                            value=value,
-                            step=int(step) if is_integer else step,
-                            key=f"pred_{feature}",
-                        )
-                        inputs[feature] = int(chosen) if is_integer else float(chosen)
-
-        submitted = st.form_submit_button(
-            "🎯 Bashorat Qilish",
-            type="primary",
-            width="stretch",
-        )
-
-    if submitted:
-        student_df = pd.DataFrame([inputs], columns=X.columns)
-        probability = float(prediction_model.predict_proba(student_df)[0, 1])
-        prediction = int(probability >= threshold)
-
-        st.divider()
-        left, right = st.columns([1, 1.15])
-        with left:
-            if prediction == 1:
-                st.success("✅ BASHORAT: PASS")
-            else:
-                st.error("❌ BASHORAT: FAIL RISK")
-
-            gauge = go.Figure(
-                go.Indicator(
-                    mode="gauge+number+delta",
-                    value=probability * 100,
-                    title={"text": "Pass ehtimoli (%)"},
-                    delta={"reference": threshold * 100},
-                    gauge={
-                        "axis": {"range": [0, 100]},
-                        "steps": [
-                            {"range": [0, threshold * 100], "color": "#FADBD8"},
-                            {"range": [threshold * 100, 100], "color": "#D5F5E3"},
-                        ],
-                        "threshold": {
-                            "line": {"color": "red", "width": 4},
-                            "thickness": 0.75,
-                            "value": threshold * 100,
-                        },
-                    },
-                )
-            )
-            st.plotly_chart(gauge, width="stretch")
-
-        with right:
-            st.subheader("Kiritilgan ma'lumot")
-            display_df = student_df.T.reset_index()
-            display_df.columns = ["Feature", "Value"]
-            st.dataframe(display_df, width="stretch", hide_index=True, height=430)
-
-            if prediction == 0:
-                st.warning(
-                    "Bu natija jazo yoki yakuniy hukm emas. U o'quvchini qo'shimcha "
-                    "qo'llab-quvvatlash uchun signal sifatida ishlatilishi kerak."
-                )
-
-# ════════════════════════════════════════
-# ℹ️ MODEL CARD
-# ════════════════════════════════════════
-elif page == "ℹ️ Model Card":
-    st.title("ℹ️ Model Card")
-    st.divider()
-
-    st.markdown(
-        f"""
-        ### Maqsad
-        UCI Student Performance ma'lumotlari asosida o'quvchining `G3 ≥ 10`
-        bo'lish ehtimolini baholash.
-
-        ### Dataset
-        - Qatorlar: **{len(df)}**
-        - Model featurelari: **{X.shape[1]}**
-        - Target: **0 = Fail, 1 = Pass**
-        - Modeldan chiqarilgan ustunlar: **G1, G2, G3, target**
-
-        ### Validatsiya
-        - Outer CV: **5-fold StratifiedKFold**
-        - Inner CV: **5-fold StratifiedKFold**
-        - Asosiy tanlash metrikasi: **F1**
-        - Qo'shimcha metrikalar: Accuracy, Precision, Recall, AUC-ROC
-
-        ### Cheklovlar
-        - Dataset kichik; natijalar boshqa universitetga avtomatik ko'chmaydi.
-        - Model sababni isbotlamaydi; faqat statistik bog'lanishni o'rganadi.
-        - Demografik featurelar fairness tekshiruvisiz qaror chiqarish uchun ishlatilmasligi kerak.
-        - Bashorat o'qituvchi yoki ma'muriy qarorni almashtirmaydi.
-        """
-    )
-
-    if bundle:
-        best_name = bundle["best_model_name"]
-        st.subheader("Joriy eng yaxshi model")
-        st.write(f"**Model:** {best_name}")
-        st.write(f"**Best parameters:** {bundle['results'][best_name]['best_params']}")
-        st.write(
-            f"**F1:** {metric_mean(bundle, best_name, 'F1'):.3f} ± "
-            f"{metric_std(bundle, best_name, 'F1'):.3f}"
-        )
-        st.write(
-            f"**AUC-ROC:** {metric_mean(bundle, best_name, 'AUC-ROC'):.3f} ± "
-            f"{metric_std(bundle, best_name, 'AUC-ROC'):.3f}"
-        )
-    else:
-        st.info("Joriy trening natijasi mavjud emas.")
+        st.info("Run Model Lab to enable the full evidence export.")
